@@ -35,6 +35,7 @@ const GameEngine = {
   pickups: [],
   bossWarningTimer: 0,
   bossWarningText: '',
+  damageVignetteTimer: 0,
 
   // --- Wave / Spawn ---
   waveIndex: 0,
@@ -377,6 +378,10 @@ const GameEngine = {
     p.rangeMultiplier = 1;
     p.moveSpeedMultiplier = 1;
     p.pickupRange = GameData.GAME_CONFIG.PLAYER_BASE_PICKUP_RANGE || 50;
+    p.critChance = 0; // accumulator, applied to critRate at end
+    p.lifeSteal = 0;
+    p.armor = 0;
+    p.expMultiplier = p.baseExpMultiplier || 1;
 
     for (const pas of p.passives) {
       const def = GameData.PASSIVE_SKILLS ? GameData.PASSIVE_SKILLS[pas.id] : null;
@@ -393,8 +398,14 @@ const GameEngine = {
           p.maxHp += hpBonus;
           p.hp = Math.min(p.hp + hpBonus, p.maxHp);
           break;
+        case 'crit_chance': p.critChance += bonus; break;
+        case 'life_steal': p.lifeSteal += bonus; break;
+        case 'armor': p.armor += bonus; break;
+        case 'exp_boost': p.expMultiplier += bonus; break;
       }
     }
+    // Apply crit from passive to critRate
+    p.critRate = Math.min(p.critRate + p.critChance, 0.8);
   },
 
   // =========================================================================
@@ -428,6 +439,7 @@ const GameEngine = {
     this.updateParticles(dt);
     this.updatePickups(dt);
     if (this.bossWarningTimer > 0) this.bossWarningTimer -= dt;
+    if (this.damageVignetteTimer > 0) this.damageVignetteTimer -= dt;
     this.updateCamera(dt);
     this.updateSpawner(dt);
     this.checkVictory();
@@ -514,10 +526,20 @@ const GameEngine = {
     e.x = x;
     e.y = y;
     e.type = type;
-    e.hp = (def ? def.hp : 20) * (1 + this.waveIndex * 0.1);
+    // Use per-wave multipliers from WAVES data for progressive scaling
+    const wave = (typeof GameData !== 'undefined' && GameData.WAVES) ? GameData.WAVES[this.waveIndex] : null;
+    const hpMul = wave && wave.hpMul ? wave.hpMul : (1 + this.waveIndex * 0.1);
+    const dmgMul = wave && wave.dmgMul ? wave.dmgMul : (1 + this.waveIndex * 0.05);
+    const spdMul = wave && wave.spdMul ? wave.spdMul : 1.0;
+    // Elite waves get an extra 40% HP and 20% damage
+    const eliteBonus = wave && wave.elite ? 1.4 : 1.0;
+    const eliteDmg = wave && wave.elite ? 1.2 : 1.0;
+
+    e.hp = (def ? def.hp : 20) * hpMul * eliteBonus;
     e.maxHp = e.hp;
-    e.speed = def ? def.speed : 60;
-    e.damage = (def ? def.damage : 5) * (1 + this.waveIndex * 0.05);
+    e.speed = (def ? def.speed : 60) * spdMul;
+    e.damage = (def ? def.damage : 5) * dmgMul * eliteDmg;
+    e.isElite = !!(wave && wave.elite);
     e.expValue = def ? def.expValue : 5;
     e.size = def ? (def.size || 16) : 16;
     e.color = def ? (def.color || '#e74c3c') : '#e74c3c';
@@ -528,6 +550,7 @@ const GameEngine = {
     e.knockbackTimer = 0;
     e.isBoss = !!(overrides && overrides.isBoss);
     e.freezeTimer = 0;
+    e.hitFlash = 0;
     e.alive = true;
 
     if (overrides) Object.assign(e, overrides);
@@ -554,6 +577,9 @@ const GameEngine = {
         e.animTimer = 0;
         e.animFrame = (e.animFrame + 1) % 2;
       }
+
+      // Hit flash decay
+      if (e.hitFlash > 0) e.hitFlash -= dt;
 
       // Knockback
       if (e.knockbackTimer > 0) {
@@ -591,6 +617,10 @@ const GameEngine = {
     const p = this.player;
     if (p.invincibleTimer > 0) return;
 
+    // Armor reduces damage
+    const reduction = p.armor || 0;
+    amount = Math.max(1, amount * (1 - reduction));
+
     p.hp -= amount;
     p.invincibleTimer = 1.0 + (p.invincibleBonus || 0);
 
@@ -604,6 +634,7 @@ const GameEngine = {
 
     this.spawnDamageNumber(p.x, p.y - 20, Math.round(amount), '#e74c3c', true);
     this.triggerShake(4, 0.2);
+    this.damageVignetteTimer = 0.3;
 
     if (p.hp <= 0) {
       p.hp = 0;
@@ -613,7 +644,9 @@ const GameEngine = {
           time: this.gameTime,
           kills: this.killCount,
           gold: this.gold,
-          level: p.level
+          level: p.level,
+          waveIndex: this.waveIndex + 1,
+          totalWaves: GameData.WAVES ? GameData.WAVES.length : 17
         });
       }
     }
@@ -735,19 +768,25 @@ const GameEngine = {
       const bossType = wave.miniBoss.type;
       const bossDef = GameData.ENEMIES[bossType];
       const bossStats = bossDef ? bossDef.boss : {};
-      const pos = this.getSpawnPositionOutsideScreen();
-      this.spawnEnemy(bossType, pos.x, pos.y, {
-        isBoss: true,
-        hp: bossStats.hp || 200,
-        maxHp: bossStats.hp || 200,
-        size: bossStats.size || 30,
-        damage: bossStats.damage || 4,
-        speed: bossStats.speed || bossDef.speed || 40,
-        expValue: bossStats.expValue || 50
-      });
+      const bossCount = wave.miniBoss.count || 1;
+      const bHpMul = wave.hpMul || 1;
+      const bDmgMul = wave.dmgMul || 1;
+      const bSpdMul = wave.spdMul || 1;
+      for (let bi = 0; bi < bossCount; bi++) {
+        const pos = this.getSpawnPositionOutsideScreen();
+        this.spawnEnemy(bossType, pos.x, pos.y, {
+          isBoss: true,
+          hp: (bossStats.hp || 200) * bHpMul,
+          maxHp: (bossStats.hp || 200) * bHpMul,
+          size: bossStats.size || 30,
+          damage: (bossStats.damage || 4) * bDmgMul,
+          speed: (bossStats.speed || bossDef.speed || 40) * bSpdMul,
+          expValue: (bossStats.expValue || 50) * Math.max(1, bHpMul * 0.5)
+        });
+      }
       this.triggerShake(6, 0.4);
       this.bossWarningTimer = 2.0;
-      this.bossWarningText = 'BOSS INCOMING!';
+      this.bossWarningText = bossCount > 1 ? `${bossCount}x BOSS INCOMING!` : 'BOSS INCOMING!';
     }
 
     // Check for final boss in wave data
@@ -756,15 +795,18 @@ const GameEngine = {
       const bossType = wave.finalBoss.type;
       const bossDef = GameData.ENEMIES[bossType];
       const bossStats = bossDef ? bossDef.boss : {};
+      const bHpMul = wave.hpMul || 1;
+      const bDmgMul = wave.dmgMul || 1;
+      // Final boss gets extra 2x multiplier on top of wave scaling
       const pos = this.getSpawnPositionOutsideScreen();
       this.spawnEnemy(bossType, pos.x, pos.y, {
         isBoss: true,
-        hp: bossStats.hp || 200,
-        maxHp: bossStats.hp || 200,
-        size: bossStats.size || 30,
-        damage: bossStats.damage || 4,
-        speed: bossStats.speed || bossDef.speed || 40,
-        expValue: bossStats.expValue || 50
+        hp: (bossStats.hp || 200) * bHpMul * 2,
+        maxHp: (bossStats.hp || 200) * bHpMul * 2,
+        size: (bossStats.size || 30) * 1.3,
+        damage: (bossStats.damage || 4) * bDmgMul * 1.5,
+        speed: (bossStats.speed || bossDef.speed || 40) * 0.9,
+        expValue: (bossStats.expValue || 50) * bHpMul
       });
       this.triggerShake(10, 0.6);
       this.bossWarningTimer = 2.5;
@@ -825,7 +867,10 @@ const GameEngine = {
           time: this.gameTime,
           kills: this.killCount,
           gold: this.gold,
-          level: this.player.level
+          level: this.player.level,
+          waveIndex: this.waveIndex + 1,
+          totalWaves: GameData.WAVES ? GameData.WAVES.length : 17,
+          victory: true
         });
       }
     }
@@ -857,6 +902,8 @@ const GameEngine = {
       case 'lightning': this.fireLightning(skill); break;
       case 'whirlwind': this.fireWhirlwind(skill); break;
       case 'summon': this.fireSummon(skill); break;
+      case 'poison_cloud': this.firePoisonCloud(skill); break;
+      case 'shield_orb': this.fireShieldOrb(skill); break;
     }
   },
 
@@ -1088,6 +1135,59 @@ const GameEngine = {
     }
   },
 
+  firePoisonCloud(skill) {
+    const p = this.player;
+    const { dmg } = this.calcSkillDamage(skill);
+    const range = (skill.range || 100) * p.rangeMultiplier * (skill.evolved ? 1.6 : 1);
+    // Place cloud at nearest enemy or random offset
+    const target = this.getNearestEnemy(p.x, p.y, 300);
+    const tx = target ? target.x : p.x + (Math.random() - 0.5) * 200;
+    const ty = target ? target.y : p.y + (Math.random() - 0.5) * 200;
+
+    this.spawnProjectile({
+      x: tx,
+      y: ty,
+      type: 'poison_cloud',
+      damage: dmg,
+      radius: range,
+      color: '#66CC44',
+      life: 3 + skill.level * 0.5,
+      speed: 0,
+      tickTimer: 0,
+      tickInterval: 0.5,
+      slowAmount: skill.evolved ? 0.5 : 0
+    });
+  },
+
+  fireShieldOrb(skill) {
+    const p = this.player;
+    const { dmg } = this.calcSkillDamage(skill);
+    const orbCount = 2 + Math.floor(skill.level / 2) + (skill.evolved ? 2 : 0);
+
+    // Only spawn if fewer shield orbs exist than allowed
+    const existing = this.projectiles.filter(pr => pr.type === 'shield_orb' && pr.alive).length;
+    const toSpawn = Math.max(0, orbCount - existing);
+
+    for (let i = 0; i < toSpawn; i++) {
+      const angle = (existing + i) * (Math.PI * 2 / orbCount);
+      this.spawnProjectile({
+        x: p.x,
+        y: p.y,
+        type: 'shield_orb',
+        damage: dmg,
+        radius: 8,
+        color: '#FFD700',
+        life: 6 + skill.level,
+        speed: 0,
+        orbAngle: angle,
+        orbDist: 50 + skill.level * 5,
+        orbSpeed: 2 + skill.level * 0.3,
+        evolved: skill.evolved,
+        hitCooldown: {}
+      });
+    }
+  },
+
   // =========================================================================
   //  SECTION: Projectile Update
   // =========================================================================
@@ -1117,6 +1217,12 @@ const GameEngine = {
           break;
         case 'pet':
           this.updatePetProjectile(proj, dt);
+          break;
+        case 'poison_cloud':
+          this.updatePoisonCloud(proj, dt);
+          break;
+        case 'shield_orb':
+          this.updateShieldOrb(proj, dt);
           break;
       }
     }
@@ -1206,6 +1312,59 @@ const GameEngine = {
     }
   },
 
+  updatePoisonCloud(proj, dt) {
+    // Periodic tick damage to enemies inside cloud
+    proj.tickTimer = (proj.tickTimer || 0) + dt;
+    if (proj.tickTimer >= (proj.tickInterval || 0.5)) {
+      proj.tickTimer = 0;
+      for (const e of this.enemies) {
+        if (!e.alive) continue;
+        const d = this.dist(proj, e);
+        if (d < proj.radius + e.size / 2) {
+          this.applyDamageToEnemy(e, proj.damage, false);
+          // Slow from evolved poison
+          if (proj.slowAmount > 0) {
+            e.freezeTimer = Math.max(e.freezeTimer, 0.3);
+          }
+        }
+      }
+    }
+    // Slight grow/shrink animation
+    proj._pulse = (proj._pulse || 0) + dt;
+  },
+
+  updateShieldOrb(proj, dt) {
+    const p = this.player;
+    // Orbit around player
+    proj.orbAngle += (proj.orbSpeed || 2) * dt;
+    proj.x = p.x + Math.cos(proj.orbAngle) * (proj.orbDist || 55);
+    proj.y = p.y + Math.sin(proj.orbAngle) * (proj.orbDist || 55);
+
+    // Hit enemies with cooldown per-enemy
+    if (!proj.hitCooldown) proj.hitCooldown = {};
+    for (const e of this.enemies) {
+      if (!e.alive) continue;
+      const d = this.dist(proj, e);
+      if (d < proj.radius + e.size / 2) {
+        const eKey = e.x + '_' + e.y; // rough key
+        const lastHit = proj.hitCooldown[eKey] || 0;
+        if (this.gameTime - lastHit > 0.5) {
+          proj.hitCooldown[eKey] = this.gameTime;
+          this.applyDamageToEnemy(e, proj.damage, false);
+          // Knockback from orb
+          const n = this.normalize(e.x - proj.x, e.y - proj.y);
+          e.knockbackX = n.x * 250;
+          e.knockbackY = n.y * 250;
+          e.knockbackTimer = 0.12;
+          // Evolved: reflect damage
+          if (proj.evolved) {
+            this.spawnBurstParticles(e.x, e.y, '#FFD700', 5);
+          }
+        }
+      }
+    }
+  },
+
   checkProjectileEnemyCollision(proj) {
     for (const e of this.enemies) {
       if (!e.alive || proj.hitEnemies.has(e)) continue;
@@ -1248,6 +1407,7 @@ const GameEngine = {
   applyDamageToEnemy(enemy, damage, crit) {
     if (!enemy.alive) return;
     enemy.hp -= damage;
+    enemy.hitFlash = 0.12; // white flash timer
 
     // Knockback
     const n = this.normalize(enemy.x - this.player.x, enemy.y - this.player.y);
@@ -1256,6 +1416,12 @@ const GameEngine = {
     enemy.knockbackTimer = 0.1;
 
     this.spawnDamageNumber(enemy.x, enemy.y - enemy.size / 2, damage, crit ? '#f1c40f' : '#ffffff', false, crit);
+
+    // Life steal
+    if (this.player.lifeSteal > 0 && damage > 0) {
+      const heal = Math.max(1, Math.floor(damage * this.player.lifeSteal));
+      this.player.hp = Math.min(this.player.hp + heal, this.player.maxHp);
+    }
 
     if (enemy.hp <= 0) {
       this.killEnemy(enemy);
@@ -2015,26 +2181,184 @@ const GameEngine = {
 
     // Body bounce for walk anim
     const bounce = (p.animFrame % 2 === 1) ? -2 : 0;
-
-    // Body
     const bodyColor = this.getRoleColor(p.roleId);
-    ctx.fillStyle = bodyColor;
-    ctx.fillRect(x - w / 2, y - h / 2 + bounce, w, h);
+    const facing = p.facing || 1;
 
-    // Outline
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(x - w / 2, y - h / 2 + bounce, w, h);
+    ctx.save();
 
-    // Eyes
-    const eyeOffsetX = p.facing > 0 ? 3 : -3;
+    switch (p.roleId) {
+      case 'swordsman': {
+        // Armored knight: body + shoulder pads + sword
+        ctx.fillStyle = bodyColor;
+        ctx.fillRect(x - w / 2, y - h / 2 + bounce, w, h);
+        ctx.strokeStyle = '#2255AA';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x - w / 2, y - h / 2 + bounce, w, h);
+        // Shoulder pads
+        ctx.fillStyle = '#3366BB';
+        ctx.fillRect(x - w / 2 - 3, y - h / 2 + 2 + bounce, 5, 6);
+        ctx.fillRect(x + w / 2 - 2, y - h / 2 + 2 + bounce, 5, 6);
+        // Sword on side
+        const sx = x + facing * (w / 2 + 3);
+        ctx.strokeStyle = '#AAC8FF';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(sx, y - 2 + bounce);
+        ctx.lineTo(sx, y - h / 2 - 8 + bounce);
+        ctx.stroke();
+        // Sword hilt
+        ctx.strokeStyle = '#f1c40f';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(sx - 3, y - 1 + bounce);
+        ctx.lineTo(sx + 3, y - 1 + bounce);
+        ctx.stroke();
+        // Helmet visor
+        ctx.fillStyle = '#223366';
+        ctx.fillRect(x - 3, y - h / 2 + bounce, 6, 3);
+        break;
+      }
+      case 'mage': {
+        // Robed mage with pointy hat
+        ctx.fillStyle = bodyColor;
+        // Robe body (wider at bottom)
+        ctx.beginPath();
+        ctx.moveTo(x - w / 2 + 2, y - h / 2 + 4 + bounce);
+        ctx.lineTo(x + w / 2 - 2, y - h / 2 + 4 + bounce);
+        ctx.lineTo(x + w / 2 + 2, y + h / 2 + bounce);
+        ctx.lineTo(x - w / 2 - 2, y + h / 2 + bounce);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = '#AA2222';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        // Pointed hat
+        ctx.fillStyle = '#CC3333';
+        ctx.beginPath();
+        ctx.moveTo(x, y - h / 2 - 10 + bounce);
+        ctx.lineTo(x - w / 2 + 1, y - h / 2 + 4 + bounce);
+        ctx.lineTo(x + w / 2 - 1, y - h / 2 + 4 + bounce);
+        ctx.closePath();
+        ctx.fill();
+        // Hat brim
+        ctx.fillStyle = '#992222';
+        ctx.fillRect(x - w / 2 - 1, y - h / 2 + 2 + bounce, w + 2, 3);
+        // Staff
+        const stx = x + facing * (w / 2 + 4);
+        ctx.strokeStyle = '#8B4513';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(stx, y + h / 2 + bounce);
+        ctx.lineTo(stx, y - h / 2 - 4 + bounce);
+        ctx.stroke();
+        // Staff orb
+        ctx.fillStyle = '#FF6644';
+        ctx.beginPath();
+        ctx.arc(stx, y - h / 2 - 6 + bounce, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(255,100,60,0.3)';
+        ctx.beginPath();
+        ctx.arc(stx, y - h / 2 - 6 + bounce, 5, 0, Math.PI * 2);
+        ctx.fill();
+        break;
+      }
+      case 'summoner': {
+        // Hooded summoner with glowing eyes
+        ctx.fillStyle = bodyColor;
+        // Cloak body
+        ctx.beginPath();
+        ctx.moveTo(x - w / 2, y - h / 2 + 2 + bounce);
+        ctx.lineTo(x + w / 2, y - h / 2 + 2 + bounce);
+        ctx.lineTo(x + w / 2 + 3, y + h / 2 + 2 + bounce);
+        ctx.lineTo(x - w / 2 - 3, y + h / 2 + 2 + bounce);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = '#7722CC';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        // Hood
+        ctx.fillStyle = '#7733DD';
+        ctx.beginPath();
+        ctx.arc(x, y - h / 2 + 2 + bounce, w / 2 + 1, Math.PI, 0);
+        ctx.closePath();
+        ctx.fill();
+        // Glowing purple eyes
+        ctx.fillStyle = '#FF66FF';
+        ctx.shadowColor = '#FF66FF';
+        ctx.shadowBlur = 6;
+        ctx.fillRect(x - 4, y - h / 2 + 4 + bounce, 3, 2);
+        ctx.fillRect(x + 2, y - h / 2 + 4 + bounce, 3, 2);
+        ctx.shadowBlur = 0;
+        // Book
+        const bx = x - facing * (w / 2 + 4);
+        ctx.fillStyle = '#553399';
+        ctx.fillRect(bx - 3, y - 2 + bounce, 6, 8);
+        ctx.fillStyle = '#f1c40f';
+        ctx.fillRect(bx - 2, y + bounce, 4, 1);
+        ctx.restore();
+        return; // skip default eyes
+      }
+      case 'icemaiden': {
+        // Crystal ice maiden with tiara
+        ctx.fillStyle = bodyColor;
+        // Body (slightly narrower, elegant)
+        ctx.fillRect(x - w / 2 + 1, y - h / 2 + bounce, w - 2, h);
+        // Skirt flare
+        ctx.beginPath();
+        ctx.moveTo(x - w / 2, y + 2 + bounce);
+        ctx.lineTo(x + w / 2, y + 2 + bounce);
+        ctx.lineTo(x + w / 2 + 3, y + h / 2 + 2 + bounce);
+        ctx.lineTo(x - w / 2 - 3, y + h / 2 + 2 + bounce);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = '#22AACC';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        // Ice tiara
+        ctx.fillStyle = '#AAF0FF';
+        ctx.beginPath();
+        ctx.moveTo(x - 6, y - h / 2 + 1 + bounce);
+        ctx.lineTo(x - 3, y - h / 2 - 5 + bounce);
+        ctx.lineTo(x, y - h / 2 + 1 + bounce);
+        ctx.lineTo(x + 3, y - h / 2 - 7 + bounce);
+        ctx.lineTo(x + 6, y - h / 2 + 1 + bounce);
+        ctx.closePath();
+        ctx.fill();
+        // Ice aura particles
+        const t = this.gameTime * 2;
+        ctx.fillStyle = 'rgba(170,240,255,0.5)';
+        for (let i = 0; i < 3; i++) {
+          const ang = t + i * (Math.PI * 2 / 3);
+          const r = w / 2 + 6;
+          const px = x + Math.cos(ang) * r;
+          const py = y + Math.sin(ang) * r * 0.6 + bounce;
+          ctx.beginPath();
+          ctx.arc(px, py, 2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        break;
+      }
+      default: {
+        ctx.fillStyle = bodyColor;
+        ctx.fillRect(x - w / 2, y - h / 2 + bounce, w, h);
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x - w / 2, y - h / 2 + bounce, w, h);
+        break;
+      }
+    }
+
+    // Eyes (shared for most roles)
+    const eyeOffsetX = facing > 0 ? 3 : -3;
     ctx.fillStyle = '#fff';
     ctx.fillRect(x + eyeOffsetX - 4, y - 4 + bounce, 4, 4);
     ctx.fillRect(x + eyeOffsetX + 2, y - 4 + bounce, 4, 4);
     // Pupils
     ctx.fillStyle = '#000';
-    ctx.fillRect(x + eyeOffsetX - 3 + (p.facing > 0 ? 1 : 0), y - 3 + bounce, 2, 2);
-    ctx.fillRect(x + eyeOffsetX + 3 + (p.facing > 0 ? 1 : 0), y - 3 + bounce, 2, 2);
+    ctx.fillRect(x + eyeOffsetX - 3 + (facing > 0 ? 1 : 0), y - 3 + bounce, 2, 2);
+    ctx.fillRect(x + eyeOffsetX + 3 + (facing > 0 ? 1 : 0), y - 3 + bounce, 2, 2);
+
+    ctx.restore();
   },
 
   getRoleColor(roleId) {
@@ -2054,8 +2378,8 @@ const GameEngine = {
       ctx.ellipse(e.x, e.y + e.size / 2 + 2, e.size / 2, 3, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Freeze tint
-      const col = e.freezeTimer > 0 ? '#88e0ef' : e.color;
+      // Freeze tint / hit flash
+      const col = e.hitFlash > 0 ? '#ffffff' : (e.freezeTimer > 0 ? '#88e0ef' : e.color);
 
       if (e.isBoss) {
         // Boss: larger, with crown
@@ -2225,6 +2549,21 @@ const GameEngine = {
       ctx.fillRect(e.x - 3, e.y - 2 + bounce, 2, 2);
       ctx.fillRect(e.x + 3, e.y - 2 + bounce, 2, 2);
 
+      // Elite aura (pulsing red glow)
+      if (e.isElite && !e.isBoss) {
+        const pulse = 0.4 + 0.3 * Math.sin(this.gameTime * 4 + e.x * 0.1);
+        ctx.save();
+        ctx.globalAlpha = pulse;
+        ctx.strokeStyle = '#ff4444';
+        ctx.lineWidth = 2;
+        ctx.shadowColor = '#ff4444';
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y + bounce, e.size / 2 + 4, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
       // HP bar (if damaged)
       if (e.hp < e.maxHp) {
         const barW = e.size;
@@ -2249,6 +2588,8 @@ const GameEngine = {
         case 'homing':     this.renderHomingProj(ctx, proj); break;
         case 'orbital':    this.renderOrbitalProj(ctx, proj); break;
         case 'pet':        this.renderPetProj(ctx, proj); break;
+        case 'poison_cloud': this.renderPoisonCloudProj(ctx, proj); break;
+        case 'shield_orb':  this.renderShieldOrbProj(ctx, proj); break;
         default:
           ctx.fillStyle = proj.color;
           ctx.beginPath();
@@ -2561,6 +2902,104 @@ const GameEngine = {
     ctx.beginPath();
     ctx.arc(r * 0.26, eyeY - r * 0.05, r * 0.06, 0, Math.PI * 2);
     ctx.fill();
+
+    ctx.restore();
+  },
+
+  // --- Poison Cloud: swirling toxic mist ---
+  renderPoisonCloudProj(ctx, proj) {
+    const r = proj.radius;
+    const pulse = proj._pulse || 0;
+    const breathe = 1 + Math.sin(pulse * 2) * 0.08;
+    const alpha = Math.min(proj.life / 0.5, 1) * 0.5;
+
+    ctx.save();
+    ctx.translate(proj.x, proj.y);
+    ctx.globalAlpha = alpha;
+
+    // Outer mist gradient
+    const grd = ctx.createRadialGradient(0, 0, 0, 0, 0, r * breathe);
+    grd.addColorStop(0, 'rgba(80,180,50,0.4)');
+    grd.addColorStop(0.6, 'rgba(60,150,30,0.2)');
+    grd.addColorStop(1, 'rgba(40,120,20,0)');
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.arc(0, 0, r * breathe, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Swirling particles inside cloud
+    for (let i = 0; i < 6; i++) {
+      const ang = pulse * 1.5 + i * (Math.PI * 2 / 6);
+      const dist = r * (0.3 + 0.3 * Math.sin(pulse * 2 + i));
+      const px = Math.cos(ang) * dist;
+      const py = Math.sin(ang) * dist;
+      ctx.fillStyle = 'rgba(100,204,68,0.6)';
+      ctx.beginPath();
+      ctx.arc(px, py, 3 + Math.sin(pulse * 3 + i) * 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Skull icon in center (subtle)
+    ctx.globalAlpha = alpha * 0.5;
+    ctx.fillStyle = '#88DD66';
+    ctx.font = `${Math.floor(r * 0.3)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('☠', 0, 0);
+
+    ctx.restore();
+  },
+
+  // --- Shield Orb: golden rotating orb ---
+  renderShieldOrbProj(ctx, proj) {
+    const r = proj.radius;
+    const time = proj.maxLife - proj.life;
+    const glow = 0.5 + Math.sin(time * 6) * 0.2;
+
+    ctx.save();
+    ctx.translate(proj.x, proj.y);
+
+    // Outer glow
+    ctx.globalAlpha = glow * 0.4;
+    ctx.fillStyle = '#FFD700';
+    ctx.shadowColor = '#FFD700';
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 1.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Core sphere
+    ctx.globalAlpha = 0.9;
+    const grd = ctx.createRadialGradient(-r * 0.2, -r * 0.2, 0, 0, 0, r);
+    grd.addColorStop(0, '#FFF8DC');
+    grd.addColorStop(0.5, '#FFD700');
+    grd.addColorStop(1, '#DAA520');
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Highlight
+    ctx.globalAlpha = 0.6;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(-r * 0.25, -r * 0.25, r * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Spinning cross pattern
+    ctx.globalAlpha = 0.4;
+    ctx.strokeStyle = '#FFF8DC';
+    ctx.lineWidth = 1.5;
+    const rot = time * 4;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(rot) * r * 0.7, Math.sin(rot) * r * 0.7);
+    ctx.lineTo(Math.cos(rot + Math.PI) * r * 0.7, Math.sin(rot + Math.PI) * r * 0.7);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(rot + Math.PI / 2) * r * 0.7, Math.sin(rot + Math.PI / 2) * r * 0.7);
+    ctx.lineTo(Math.cos(rot + Math.PI * 1.5) * r * 0.7, Math.sin(rot + Math.PI * 1.5) * r * 0.7);
+    ctx.stroke();
 
     ctx.restore();
   },
@@ -2909,6 +3348,19 @@ const GameEngine = {
 
     // --- Mini-map (bottom-right) ---
     this.renderMiniMap(ctx);
+
+    // --- Damage vignette (red flash on player hit) ---
+    if (this.damageVignetteTimer > 0) {
+      const alpha = (this.damageVignetteTimer / 0.3) * 0.35;
+      const grd = ctx.createRadialGradient(
+        this.width / 2, this.height / 2, this.width * 0.3,
+        this.width / 2, this.height / 2, this.width * 0.7
+      );
+      grd.addColorStop(0, 'rgba(200,0,0,0)');
+      grd.addColorStop(1, `rgba(200,0,0,${alpha})`);
+      ctx.fillStyle = grd;
+      ctx.fillRect(0, 0, this.width, this.height);
+    }
   },
 
   renderProgressTimeline(ctx) {

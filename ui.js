@@ -1483,7 +1483,8 @@ const GameUI = {
 
     const skillIcons = {
       flying_sword: '🗡️', fireball: '🔥', ice_ring: '❄️',
-      lightning: '⚡', whirlwind: '🌀', summon: '💀'
+      lightning: '⚡', whirlwind: '🌀', summon: '💀',
+      poison_cloud: '☠️', shield_orb: '🛡️'
     };
 
     choices.forEach(choice => {
@@ -1494,6 +1495,7 @@ const GameUI = {
       let name = '';
       let desc = '';
       let levelText = '';
+      let rarity = 'common';
 
       if (choice.type === 'passive') {
         const pDef = GameData.PASSIVE_SKILLS[choice.id];
@@ -1502,11 +1504,17 @@ const GameUI = {
         desc = pDef ? pDef.description : '';
         const currentLvl = choice.currentLevel || 0;
         levelText = 'Lv.' + currentLvl + ' → Lv.' + (currentLvl + 1);
+        // Show numeric bonus
+        if (pDef && pDef.bonusPerLevel) {
+          const pct = Math.round(pDef.bonusPerLevel * 100);
+          desc += ` (+${pct}%/级)`;
+        }
       } else {
         // skill_upgrade or skill_new
         const sDef = GameData.SKILLS[choice.id];
         icon = skillIcons[choice.id] || '✦';
         name = sDef ? sDef.name : choice.id;
+        rarity = (sDef && sDef.rarity) || 'common';
         if (choice.type === 'skill_new') {
           desc = sDef ? sDef.description : '';
           levelText = '新技能!';
@@ -1516,9 +1524,16 @@ const GameUI = {
           if (currentLvl === 4 && sDef && sDef.evolveDescription) {
             desc = sDef.evolveDescription;
             levelText = 'Lv.4 → Lv.5 进化!';
+            rarity = 'epic';
           } else {
             desc = sDef ? sDef.description : '';
             levelText = 'Lv.' + currentLvl + ' → Lv.' + (currentLvl + 1);
+            // Show damage info
+            if (sDef && sDef.baseDamage) {
+              const dmgNow = Math.round(sDef.baseDamage * (1 + (currentLvl - 1) * 0.3));
+              const dmgNext = Math.round(sDef.baseDamage * (1 + currentLvl * 0.3));
+              desc += ` (${dmgNow}→${dmgNext})`;
+            }
           }
         }
       }
@@ -1527,6 +1542,23 @@ const GameUI = {
       const nameEl = this._el('div', 'lc-name', name);
       const descEl = this._el('div', 'lc-desc', desc);
       const lvlEl = this._el('div', 'lc-level', levelText);
+
+      // Apply rarity colors
+      const rarityColors = {
+        common: { border: 'rgba(255,255,255,0.15)', glow: 'none', nameColor: '#fff' },
+        rare: { border: '#5588FF', glow: '0 0 12px rgba(85,136,255,0.3)', nameColor: '#88BBFF' },
+        epic: { border: '#f1c40f', glow: '0 0 16px rgba(241,196,15,0.4)', nameColor: '#f1c40f' },
+      };
+      const rc = rarityColors[rarity] || rarityColors.common;
+      card.style.borderColor = rc.border;
+      if (rc.glow !== 'none') card.style.boxShadow = rc.glow;
+      nameEl.style.color = rc.nameColor;
+
+      // New skill badge
+      if (levelText === '新技能!') {
+        lvlEl.style.color = rarity === 'rare' ? '#88BBFF' : '#2ecc71';
+        lvlEl.style.fontWeight = 'bold';
+      }
 
       // Highlight evolution cards
       if (levelText.includes('进化')) {
@@ -1611,10 +1643,16 @@ const GameUI = {
     // Display stats
     if (statsEl) {
       statsEl.innerHTML = '';
+      const waveText = (stats && stats.waveIndex)
+        ? `${stats.waveIndex} / ${stats.totalWaves || 17}`
+        : '-';
       const rows = [
         ['存活时间', this.formatTime(time)],
         ['击杀数', String(kills)],
         ['到达等级', 'Lv.' + playerLevel],
+        ['到达波次', waveText],
+        ['累计击杀', String(SaveManager.data.stats.totalKills)],
+        ['最佳时间', this.formatTime(SaveManager.data.stats.bestTime)],
       ];
       rows.forEach(([label, value]) => {
         const row = this._el('div', 'stat-row');
